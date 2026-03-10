@@ -18,7 +18,9 @@ T = 2.0;
 φ(t) = [3.0];
 
 hayes_ode, hayes_meta = SddeToOde.get_ode_from_sdde(A, B, c, α, β, γ; τ=τ, T=T, φ=φ, m=20);
-
+# if you want DDEProblem outpu, use dde=true
+hayes_dde, hayes_dde_meta = SddeToOde.get_ode_from_sdde(A, B, c, α, β, γ; τ=τ, T=T, φ=φ, m=20, dde=true);
+# if you use DDEProblem output, use MethodOfSteps(Tsit5())
 hayes_sol = solve(hayes_ode, Tsit5(), dt=τ/1000, adaptive=false);
 
 hayes_res = [SddeToOde.get_x_moments(hayes_sol, hayes_meta, t) for t in hayes_sol.t];

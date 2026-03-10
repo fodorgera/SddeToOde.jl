@@ -30,7 +30,10 @@ end;
 T = 10;
 
 mathieu_ode, mathieu_meta = SddeToOde.get_ode_from_sdde(AM, BM, cM, αM, βM, γM; τ=τ, T=T, φ=φ, m=10);
+# if you want DDEProblem outpu, use dde=true
+mathieu_dde, mathieu_dde_meta = SddeToOde.get_ode_from_sdde(AM, BM, cM, αM, βM, γM; τ=τ, T=T, φ=φ, m=10, dde=true);
 
+# if you use DDEProblem output, use MethodOfSteps(Tsit5())
 mathieu_sol = solve(mathieu_ode, Tsit5(), dt=τ/1000, adaptive=false);
 
 mathieu_res = [SddeToOde.get_x_moments(mathieu_sol, mathieu_meta, t) for t in mathieu_sol.t];
