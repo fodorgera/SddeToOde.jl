@@ -5,33 +5,21 @@
 end
 
 """
-Build extended drift matrix A_e and drift vector c_e for the upwind transport delay line.
+Build the time-independent delay-line drift (shift chain) for the upwind transport approximation.
 
 z = [x0; x1; ...; xm], each xj ∈ R^n, N = n*(m+1)
-x0' = A x0 + B xm + c
-xj' = (1/h)(x_{j-1} - xj), j=1..m
+This contains only the xj' = (1/h)(x_{j-1} - xj) part for j = 1..m.
 """
-function build_extended_drift(A, B, c, τ; m::Int)
-    n = size(A,1)
-    @assert size(A,2)==n
-    @assert size(B,1)==n && size(B,2)==n
-    @assert length(c)==n
+function build_delay_chain_drift(n::Int, τ; m::Int)
     @assert m ≥ 1
 
     h = τ/m
     N = n*(m+1)
 
-    Ae = zeros(eltype(A), N, N)
-    ce = zeros(eltype(c), N)
+    Ae = zeros(Float64, N, N)
+    ce = zeros(Float64, N)
 
-    # x0 block
-    r0 = blockrange(n, 0)
-    Ae[r0, r0] .= A
-    Ae[r0, blockrange(n, m)] .+= B
-    ce[r0] .= c
-
-    # shift chain blocks
-    I_n = Matrix{eltype(A)}(I, n, n)
+    I_n = Matrix{Float64}(I, n, n)
     @inbounds for j in 1:m
         rj = blockrange(n, j)
         if 1 < j < m-1
@@ -54,6 +42,31 @@ function build_extended_drift(A, B, c, τ; m::Int)
             Ae[rj, rjm1] .+= (1/h)  .* I_n
         end
     end
+
+    return Ae, ce, h
+end
+
+"""
+Build full extended drift Ae and ce for constant A,B,c by adding the head block
+to the time-independent delay-chain drift.
+"""
+function build_extended_drift(A, B, c, τ; m::Int)
+    n = size(A, 1)
+    @assert size(A,2)==n
+    @assert size(B,1)==n && size(B,2)==n
+    @assert length(c)==n
+
+    Ae_delay, ce, h = build_delay_chain_drift(n, τ; m=m)
+    N = n*(m+1)
+
+    Ae = similar(Ae_delay)
+    Ae .= Ae_delay
+
+    r0 = blockrange(n, 0)
+    rm = blockrange(n, m)
+    Ae[r0, r0] .= A
+    Ae[r0, rm] .+= B
+    ce[r0] .= c
 
     return Ae, ce, h
 end
@@ -84,6 +97,8 @@ end
 """
 Solve mean/covariance ODE for the extended-state approximation.
 
+Coefficients A, B, c, α, β, γ can be constant arrays or functions of time t.
+
 Returns:
   sol: ODESolution over state y = [vec(μ); vec(P)]
 Extraction:
@@ -97,26 +112,38 @@ Mean/variance of original x(t):
 """
 function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=200,
                                 tspan=(0.0,T),dde=false, kwargs...)
-    n = size(A,1)
-    Ae, ce, h = build_extended_drift(A, B, c, τ; m=m)
+    # allow both constant and time-dependent coefficients
+    getA(t) = A isa Function ? A(t) : A
+    getB(t) = B isa Function ? B(t) : B
+    getc(t) = c isa Function ? c(t) : c
+    getα(t) = α isa Function ? α(t) : α
+    getβ(t) = β isa Function ? β(t) : β
+    getγ(t) = γ isa Function ? γ(t) : γ
+
+    A0 = getA(0.0)
+    n = size(A0, 1)
+
+    Ae_delay, ce_delay, h = build_delay_chain_drift(n, τ; m=m)
     N = n*(m+1)
 
     # Initial mean μ(0): fill delay line with history φ on [-τ,0]
     # xj(0) ≈ φ(-j*h)
-    μ0 = zeros(eltype(c), N)
+    μ0 = zeros(eltype(getc(0.0)), N)
     for j in 0:m
         μ0[blockrange(n,j)] .= φ(-j*h)
     end
 
     # Initial covariance P(0): typically zero if deterministic history
-    P0 = zeros(eltype(c), N, N)
+    P0 = zeros(eltype(getc(0.0)), N, N)
 
     y0 = vcat(vec(μ0), vec(P0))
 
     # Preallocate workspaces for the ODE RHS to avoid per-step allocations
     r0 = blockrange(n, 0)
     rm = blockrange(n, m)
-    AeT = transpose(Ae)
+    Ae = similar(Ae_delay)
+    AeT = similar(Ae_delay)
+    ce = similar(ce_delay)
     tmpP1 = similar(P0)
     tmpP2 = similar(P0)
     Q = similar(P0)
@@ -132,7 +159,19 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=200,
         @views dP = reshape(dy[N+1:end], N, N)
 
         @inbounds begin
-            # dμ = Ae * μ + ce (in-place)
+            # rebuild time-dependent Ae(t), ce(t) from delay chain + current A(t),B(t),c(t)
+            Ae .= Ae_delay
+            ce .= ce_delay
+
+            At = getA(t)
+            Bt = getB(t)
+            ct = getc(t)
+
+            @views Ae[r0, r0] .= At
+            @views Ae[r0, rm] .+= Bt
+            @views ce[r0] .= ct
+
+            # dμ = Ae(t) * μ + ce(t)
             mul!(dμ, Ae, μ)
             dμ .+= ce
 
@@ -144,14 +183,15 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=200,
             @views Pmm = P[rm, rm]
             @views P0m = P[r0, rm]
 
-            # compute EgEg in-place into workspace
-            EgEgT_from_muP!(EgEg, α, β, γ, μ_0, μ_m, P00, Pmm, P0m)
+            # compute EgEg in-place into workspace with time-dependent α,β,γ
+            EgEgT_from_muP!(EgEg, getα(t), getβ(t), getγ(t), μ_0, μ_m, P00, Pmm, P0m)
 
             # Q only has nonzero entries in the (0,0) block; reuse workspace
             fill!(Q, zeroP)
             @views Q[r0, r0] .= EgEg
 
-            # dP = Ae*P + P*Ae' + Q, computed with workspaces
+            # dP = Ae(t)*P + P*Ae(t)' + Q, computed with workspaces
+            AeT .= transpose(Ae)
             mul!(tmpP1, Ae, P)
             mul!(tmpP2, P, AeT)
             dP .= tmpP1
