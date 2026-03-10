@@ -32,16 +32,26 @@ function build_extended_drift(A, B, c, τ; m::Int)
 
     # shift chain blocks
     I_n = Matrix{eltype(A)}(I, n, n)
-    for j in 1:m
+    @inbounds for j in 1:m
         rj = blockrange(n, j)
-        rjm1 = blockrange(n, j-1)
-        rjp1 = blockrange(n, j+1)
-        if j<m
+        if 1 < j < m-1
+            rjm1 = blockrange(n, j-1)
+            rjp1 = blockrange(n, j+1)
+            rjm2 = blockrange(n, j-2)
+            rjp2 = blockrange(n, j+2)
+            Ae[rj, rjm2] .+= (-1/(12h)) .* I_n
+            Ae[rj, rjp2] .+= (1/(12h)) .* I_n
+            Ae[rj, rjm1] .+= (8/(12h)) .* I_n
+            Ae[rj, rjp1] .+= (-8/(12h)) .* I_n
+        elseif j < m
+            rjm1 = blockrange(n, j-1)
+            rjp1 = blockrange(n, j+1)
             Ae[rj, rjm1] .+= (1/(2h)) .* I_n
-            Ae[rj, rjp1]   .+= (-1/(2h)) .* I_n
+            Ae[rj, rjp1] .+= (-1/(2h)) .* I_n
         else
+            rjm1 = blockrange(n, j-1)
             Ae[rj, rj]   .+= (-1/h) .* I_n
-            Ae[rj, rjm1] .+= (1/h) .* I_n
+            Ae[rj, rjm1] .+= (1/h)  .* I_n
         end
     end
 
@@ -64,6 +74,11 @@ function EgEgT_from_muP(α, β, γ, μ0, μm, P00, Pmm, P0m)
     G .+= β*μm*γ' + γ*μm'*β'
     G .+= γ*γ'
     return G
+end
+
+function EgEgT_from_muP!(G, α, β, γ, μ0, μm, P00, Pmm, P0m)
+    G .= EgEgT_from_muP(α, β, γ, μ0, μm, P00, Pmm, P0m)
+    return nothing
 end
 
 """
@@ -105,6 +120,7 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=200,
     tmpP1 = similar(P0)
     tmpP2 = similar(P0)
     Q = similar(P0)
+    EgEg = zeros(eltype(P0), n, n)
     zeroP = zero(eltype(P0))
 
     # function f!(dy, y, hfun, p, t)
@@ -115,30 +131,33 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=200,
         @views dμ = dy[1:N]
         @views dP = reshape(dy[N+1:end], N, N)
 
-        # dμ = Ae * μ + ce (in-place)
-        mul!(dμ, Ae, μ)
-        dμ .+= ce
+        @inbounds begin
+            # dμ = Ae * μ + ce (in-place)
+            mul!(dμ, Ae, μ)
+            dμ .+= ce
 
-        # pull blocks for diffusion term (only affects x0 block)
-        @views μ_0 = μ[r0]
-        @views μ_m = μ[rm]
+            # pull blocks for diffusion term (only affects x0 block)
+            @views μ_0 = μ[r0]
+            @views μ_m = μ[rm]
 
-        @views P00 = P[r0, r0]
-        @views Pmm = P[rm, rm]
-        @views P0m = P[r0, rm]
+            @views P00 = P[r0, r0]
+            @views Pmm = P[rm, rm]
+            @views P0m = P[r0, rm]
 
-        EgEg = EgEgT_from_muP(α, β, γ, μ_0, μ_m, P00, Pmm, P0m)
+            # compute EgEg in-place into workspace
+            EgEgT_from_muP!(EgEg, α, β, γ, μ_0, μ_m, P00, Pmm, P0m)
 
-        # Q only has nonzero entries in the (0,0) block; reuse workspace
-        fill!(Q, zeroP)
-        @views Q[r0, r0] .= EgEg
+            # Q only has nonzero entries in the (0,0) block; reuse workspace
+            fill!(Q, zeroP)
+            @views Q[r0, r0] .= EgEg
 
-        # dP = Ae*P + P*Ae' + Q, computed with workspaces
-        mul!(tmpP1, Ae, P)
-        mul!(tmpP2, P, AeT)
-        dP .= tmpP1
-        dP .+= tmpP2
-        dP .+= Q
+            # dP = Ae*P + P*Ae' + Q, computed with workspaces
+            mul!(tmpP1, Ae, P)
+            mul!(tmpP2, P, AeT)
+            dP .= tmpP1
+            dP .+= tmpP2
+            dP .+= Q
+        end
 
         return nothing
     end
