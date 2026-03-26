@@ -119,14 +119,14 @@ Mean/variance of original x(t):
   μx(t) = μ0 block (j=0)
   Vx(t) = P00 block (j=0,j=0)
 """
-function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=200,
+function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=10,
                                 tspan=(0.0,T), dde=false, τ_max=nothing, kwargs...)
-    getA(t) = A isa Function ? A(t) : A
-    getB(t) = B isa Function ? B(t) : B
-    getc(t) = c isa Function ? c(t) : c
-    getα(t) = α isa Function ? α(t) : α
-    getβ(t) = β isa Function ? β(t) : β
-    getγ(t) = γ isa Function ? γ(t) : γ
+    getA(t,x,xτ) = parseFunction(A,t,x,xτ)
+    getB(t,x,xτ) = parseFunction(B,t,x,xτ)
+    getc(t,x,xτ) = parseFunction(c,t,x,xτ)
+    getα(t,x,xτ) = parseFunction(α,t,x,xτ)
+    getβ(t,x,xτ) = parseFunction(β,t,x,xτ)
+    getγ(t,x,xτ) = parseFunction(γ,t,x,xτ)
 
     τ_is_func = τ isa Function
     getτ(t) = τ_is_func ? τ(t) : τ
@@ -142,19 +142,19 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=200,
 
     use_interp = τ_is_func || τ_max !== nothing
 
-    A0 = getA(0.0)
+    A0 = getA(0.0, φ(0.0), φ(0.0))
     n = size(A0, 1)
 
     Ae_delay, ce_delay, h = build_delay_chain_drift(n, τ_grid; m=m)
     N = n*(m+1)
 
     # xj(0) ≈ φ(-j*h)
-    μ0 = zeros(eltype(getc(0.0)), N)
+    μ0 = zeros(eltype(getc(0.0, φ(0.0), φ(0.0))), N)
     for j in 0:m
         μ0[blockrange(n,j)] .= φ(-j*h)
     end
 
-    P0 = zeros(eltype(getc(0.0)), N, N)
+    P0 = zeros(eltype(getc(0.0, φ(0.0), φ(0.0))), N, N)
 
     y0 = vcat(vec(μ0), vec(P0))
 
@@ -184,10 +184,15 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=200,
         @inbounds begin
             Ae .= Ae_delay
             ce .= ce_delay
-
-            At = getA(t)
-            Bt = getB(t)
-            ct = getc(t)
+            # todo have to select the correct block of y for the function calls
+            
+            
+            # states for y and yτ
+            y0 = μ[r0]
+            yτ = μ[rm]
+            At = getA(t, y0, yτ)
+            Bt = getB(t, y0, yτ)
+            ct = getc(t, y0, yτ)
 
             @views Ae[r0, r0] .= At
             @views ce[r0] .= ct
@@ -212,13 +217,13 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=200,
 
                 @views P_0del .= s1 .* P[r0, rj] .+ s .* P[r0, rjp]
 
-                EgEgT_from_muP!(EgEg, getα(t), getβ(t), getγ(t),
+                EgEgT_from_muP!(EgEg, getα(t, y0, yτ), getβ(t, y0, yτ), getγ(t, y0, yτ),
                                 view(μ, r0), μ_del,
                                 view(P, r0, r0), P_del, P_0del)
             else
                 @views Ae[r0, rm] .+= Bt
 
-                EgEgT_from_muP!(EgEg, getα(t), getβ(t), getγ(t),
+                EgEgT_from_muP!(EgEg, getα(t, y0, yτ), getβ(t, y0, yτ), getγ(t, y0, yτ),
                                 view(μ, r0), view(μ, rm),
                                 view(P, r0, r0), view(P, rm, rm), view(P, r0, rm))
             end
@@ -249,6 +254,29 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=200,
     meta = (Ae=Ae, ce=ce, h=h, N=N, n=n, m=m, τ_max=τ_grid)
 
     return prob, meta
+end
+
+function parseFunction(f,args...)
+    if f isa Function
+        try
+            return f(args...)
+        catch
+            return f(args...)
+        end
+    else
+        return f
+    end
+end
+
+
+function get_ode_from_nsdde(f,fx,fy,g,gx,gy; kwargs...)
+    A(t,x,xτ) = fx(t,x,xτ)
+    B(t,x,xτ) = fy(t,x,xτ)
+    c(t,x,xτ) = f(t,x,xτ) .- A(t,x,xτ)*x .- B(t,x,xτ)*xτ
+    α(t,x,xτ) = gx(t,x,xτ)
+    β(t,x,xτ) = gy(t,x,xτ)
+    γ(t,x,xτ) = g(t,x,xτ) .- α(t,x,xτ)*x .- β(t,x,xτ)*xτ
+    return get_ode_from_sdde(A, B, c, α, β, γ; kwargs...)
 end
 
 """
