@@ -256,16 +256,16 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=10,
     return prob, meta
 end
 
-function parseFunction(f,t,args...)
-    if f isa Function
-        try
-            return f(t,args...)
-        catch
-            return f(t)
-        end
-    else
-        return f
+function parseFunction(f::Function, t, args...)
+    try
+        return f(t,args...)
+    catch
+        return f(t)
     end
+end
+
+function parseFunction(f::Number, t, args...)
+    return f
 end
 
 
