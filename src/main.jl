@@ -9,6 +9,8 @@ Build the time-independent delay-line drift (shift chain) for the upwind transpo
 
 z = [x0; x1; ...; xm], each xj ∈ R^n, N = n*(m+1)
 This contains only the xj' = (1/h)(x_{j-1} - xj) part for j = 1..m.
+
+Returned as a `SparseMatrixCSC` since the pattern consists only of a few block-diagonal bands.
 """
 function build_delay_chain_drift(n::Int, τ; m::Int)
     @assert m ≥ 1
@@ -16,10 +18,10 @@ function build_delay_chain_drift(n::Int, τ; m::Int)
     h = τ/m
     N = n*(m+1)
 
-    Ae = zeros(Float64, N, N)
-    ce = zeros(Float64, N)
+    I_idx = Int[]
+    J_idx = Int[]
+    V = Float64[]
 
-    I_n = Matrix{Float64}(I, n, n)
     @inbounds for j in 1:m
         rj = blockrange(n, j)
         if 1 < j < m-1
@@ -27,28 +29,37 @@ function build_delay_chain_drift(n::Int, τ; m::Int)
             rjp1 = blockrange(n, j+1)
             rjm2 = blockrange(n, j-2)
             rjp2 = blockrange(n, j+2)
-            Ae[rj, rjm2] .+= (-1/(12h)) .* I_n
-            Ae[rj, rjp2] .+= (1/(12h)) .* I_n
-            Ae[rj, rjm1] .+= (8/(12h)) .* I_n
-            Ae[rj, rjp1] .+= (-8/(12h)) .* I_n
+            for k in 1:n
+                push!(I_idx, rj[k]); push!(J_idx, rjm2[k]); push!(V, -1/(12h))
+                push!(I_idx, rj[k]); push!(J_idx, rjp2[k]); push!(V,  1/(12h))
+                push!(I_idx, rj[k]); push!(J_idx, rjm1[k]); push!(V,  8/(12h))
+                push!(I_idx, rj[k]); push!(J_idx, rjp1[k]); push!(V, -8/(12h))
+            end
         elseif j < m
             rjm1 = blockrange(n, j-1)
             rjp1 = blockrange(n, j+1)
-            Ae[rj, rjm1] .+= (1/(2h)) .* I_n
-            Ae[rj, rjp1] .+= (-1/(2h)) .* I_n
+            for k in 1:n
+                push!(I_idx, rj[k]); push!(J_idx, rjm1[k]); push!(V,  1/(2h))
+                push!(I_idx, rj[k]); push!(J_idx, rjp1[k]); push!(V, -1/(2h))
+            end
         else
             rjm1 = blockrange(n, j-1)
-            Ae[rj, rj]   .+= (-1/h) .* I_n
-            Ae[rj, rjm1] .+= (1/h)  .* I_n
+            for k in 1:n
+                push!(I_idx, rj[k]); push!(J_idx, rj[k]);   push!(V, -1/h)
+                push!(I_idx, rj[k]); push!(J_idx, rjm1[k]); push!(V,  1/h)
+            end
         end
     end
+
+    Ae = sparse(I_idx, J_idx, V, N, N)
+    ce = zeros(Float64, N)
 
     return Ae, ce, h
 end
 
 """
 Build full extended drift Ae and ce for constant A,B,c by adding the head block
-to the time-independent delay-chain drift.
+to the time-independent delay-chain drift. Returned Ae is sparse.
 """
 function build_extended_drift(A, B, c, τ; m::Int)
     n = size(A, 1)
@@ -59,15 +70,22 @@ function build_extended_drift(A, B, c, τ; m::Int)
     Ae_delay, ce, h = build_delay_chain_drift(n, τ; m=m)
     N = n*(m+1)
 
-    Ae = similar(Ae_delay)
-    Ae .= Ae_delay
+    # Add head block contributions to a (sparse) copy of Ae_delay.
+    Ae = copy(Ae_delay)
 
     r0 = blockrange(n, 0)
     rm = blockrange(n, m)
-    Ae[r0, r0] .= A
-    Ae[r0, rm] .+= B
+    # A on the (r0, r0) block (replace, since delay chain has no entries there)
+    for i in 1:n, k in 1:n
+        Ae[r0[i], r0[k]] = A[i, k]
+    end
+    # +B on the (r0, rm) block
+    for i in 1:n, k in 1:n
+        Ae[r0[i], rm[k]] += B[i, k]
+    end
     ce[r0] .= c
 
+    dropzeros!(Ae)
     return Ae, ce, h
 end
 
@@ -111,9 +129,15 @@ nodes.  The interpolated covariance blocks are:
 
 where j = floor(τ(t)/h), s = (τ(t) - j*h)/h.
 
+Internally the drift is kept as a sparse `Ae_delay` (only the delay-chain bands)
+plus a small dense head correction on the first `n` rows / columns.  The dense
+`N×N` drift is never assembled, and the expensive products `Ae*P`, `P*Ae'` are
+computed as `Ae_delay*P + head` (sparse-times-dense), saving a lot of memory
+traffic when `m` is large.
+
 Returns:
   prob: ODEProblem (or DDEProblem if dde=true) over state y = [vec(μ); vec(P)]
-  meta: NamedTuple with (Ae, ce, h, N, n, m, τ_max)
+  meta: NamedTuple with (Ae_delay, ce, h, N, n, m, τ_max)
 
 Mean/variance of original x(t):
   μx(t) = μ0 block (j=0)
@@ -148,31 +172,33 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=10,
     Ae_delay, ce_delay, h = build_delay_chain_drift(n, τ_grid; m=m)
     N = n*(m+1)
 
+    # Precompute the transpose once; kept as a sparse (adjoint) handle.
+    Ae_delayT = sparse(transpose(Ae_delay))
+
     # xj(0) ≈ φ(-j*h)
-    μ0 = zeros(eltype(getc(0.0, φ(0.0), φ(0.0))), N)
+    T0 = eltype(getc(0.0, φ(0.0), φ(0.0)))
+    μ0 = zeros(T0, N)
     for j in 0:m
         μ0[blockrange(n,j)] .= φ(-j*h)
     end
 
-    P0 = zeros(eltype(getc(0.0, φ(0.0), φ(0.0))), N, N)
+    P0 = zeros(T0, N, N)
 
     y0 = vcat(vec(μ0), vec(P0))
 
     r0 = blockrange(n, 0)
     rm = blockrange(n, m)
-    Ae = similar(Ae_delay)
-    AeT = similar(Ae_delay)
-    ce = similar(ce_delay)
-    tmpP1 = similar(P0)
-    tmpP2 = similar(P0)
-    Q = similar(P0)
-    EgEg = zeros(eltype(P0), n, n)
-    zeroP = zero(eltype(P0))
 
-    # Workspaces for interpolated delayed-state moments
-    μ_del  = zeros(eltype(P0), n)
-    P_del  = zeros(eltype(P0), n, n)
-    P_0del = zeros(eltype(P0), n, n)
+    # Workspaces — wrapped in DiffCache so implicit solvers can reuse them when
+    # ForwardDiff calls f! with Dual-typed state vectors (autodiff Jacobians).
+    EgEg_cache      = DiffCache(zeros(T0, n, n))
+    μ_del_cache     = DiffCache(zeros(T0, n))
+    P_del_cache     = DiffCache(zeros(T0, n, n))
+    P_0del_cache    = DiffCache(zeros(T0, n, n))
+    head_row_cache  = DiffCache(zeros(T0, n, N))
+    head_col_cache  = DiffCache(zeros(T0, N, n))
+    P_row_del_cache = DiffCache(zeros(T0, n, N))
+    P_col_del_cache = DiffCache(zeros(T0, N, n))
 
     function f!(dy, y, p, t)
         @views μ = y[1:N]
@@ -181,65 +207,84 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=10,
         @views dμ = dy[1:N]
         @views dP = reshape(dy[N+1:end], N, N)
 
+        # Implicit solvers may autodiff over y (Jacobian) OR over t (Wfact
+        # for time-dependent f), so the buffer eltype must follow whichever of
+        # the two is currently a Dual. Probe DiffCache with a zero of the
+        # promoted eltype.
+        probe = zero(promote_type(eltype(y), typeof(t)))
+        EgEg      = get_tmp(EgEg_cache,      probe)
+        μ_del     = get_tmp(μ_del_cache,     probe)
+        P_del     = get_tmp(P_del_cache,     probe)
+        P_0del    = get_tmp(P_0del_cache,    probe)
+        head_row  = get_tmp(head_row_cache,  probe)
+        head_col  = get_tmp(head_col_cache,  probe)
+        P_row_del = get_tmp(P_row_del_cache, probe)
+        P_col_del = get_tmp(P_col_del_cache, probe)
+
         @inbounds begin
-            Ae .= Ae_delay
-            ce .= ce_delay
-            # todo have to select the correct block of y for the function calls
-            
-            
-            # states for y and yτ
-            y0 = μ[r0]
-            yτ = μ[rm]
-            At = getA(t, y0, yτ)
-            Bt = getB(t, y0, yτ)
-            ct = getc(t, y0, yτ)
+            y0v = μ[r0]
+            yτv = μ[rm]
+            At = getA(t, y0v, yτv)
+            Bt = getB(t, y0v, yτv)
+            ct = getc(t, y0v, yτv)
 
-            @views Ae[r0, r0] .= At
-            @views ce[r0] .= ct
-
+            # Resolve the two delay-line grid nodes (rj, rjp) and interp weights.
             if use_interp
                 τt = clamp(getτ(t), 0.0, τ_grid)
                 jd = min(floor(Int, τt / h), m - 1)
                 s  = (τt - jd * h) / h
-                s1 = 1.0 - s
-
-                rj  = blockrange(n, jd)
-                rjp = blockrange(n, jd + 1)
-
-                @views Ae[r0, rj]  .+= s1 .* Bt
-                @views Ae[r0, rjp] .+= s  .* Bt
-
-                @views μ_del .= s1 .* μ[rj] .+ s .* μ[rjp]
-
-                @views P_del .= s1^2 .* P[rj, rj] .+
-                                s1*s .* (P[rj, rjp] .+ P[rjp, rj]) .+
-                                s^2  .* P[rjp, rjp]
-
-                @views P_0del .= s1 .* P[r0, rj] .+ s .* P[r0, rjp]
-
-                EgEgT_from_muP!(EgEg, getα(t, y0, yτ), getβ(t, y0, yτ), getγ(t, y0, yτ),
-                                view(μ, r0), μ_del,
-                                view(P, r0, r0), P_del, P_0del)
             else
-                @views Ae[r0, rm] .+= Bt
-
-                EgEgT_from_muP!(EgEg, getα(t, y0, yτ), getβ(t, y0, yτ), getγ(t, y0, yτ),
-                                view(μ, r0), view(μ, rm),
-                                view(P, r0, r0), view(P, rm, rm), view(P, r0, rm))
+                # Pure "Bt at rm" case == (jd=m-1, s=1).
+                jd = m - 1
+                s  = 1.0
             end
+            s1 = 1.0 - s
 
-            mul!(dμ, Ae, μ)
-            dμ .+= ce
+            rj  = blockrange(n, jd)
+            rjp = blockrange(n, jd + 1)
 
-            fill!(Q, zeroP)
-            @views Q[r0, r0] .= EgEg
+            # Interpolated delayed-state moments.
+            @views μ_del .= s1 .* μ[rj] .+ s .* μ[rjp]
+            @views P_del .= s1^2 .* P[rj, rj] .+
+                            s1*s .* (P[rj, rjp] .+ P[rjp, rj]) .+
+                            s^2  .* P[rjp, rjp]
+            @views P_0del .= s1 .* P[r0, rj] .+ s .* P[r0, rjp]
 
-            AeT .= transpose(Ae)
-            mul!(tmpP1, Ae, P)
-            mul!(tmpP2, P, AeT)
-            dP .= tmpP1
-            dP .+= tmpP2
-            dP .+= Q
+            EgEgT_from_muP!(EgEg, getα(t, y0v, yτv), getβ(t, y0v, yτv), getγ(t, y0v, yτv),
+                            view(μ, r0), μ_del,
+                            view(P, r0, r0), P_del, P_0del)
+
+            # --- dμ = Ae * μ + ce  ------------------------------------------
+            # Ae = Ae_delay + H, with H supported only on rows r0.
+            # So dμ = Ae_delay*μ (sparse*dense) + head row correction + ce.
+            mul!(dμ, Ae_delay, μ)
+            # head row: dμ[r0] += At*μ[r0] + Bt*μ_del  + ct
+            @views dμ[r0] .+= At * y0v .+ Bt * μ_del .+ ct
+
+            # --- dP = Ae*P + P*Ae' + Q  -------------------------------------
+            # Ae*P        = Ae_delay*P + H*P  (H*P nonzero only on rows r0)
+            # P*Ae'       = P*Ae_delay' + P*H' (P*H' nonzero only on cols r0)
+            # Q has only the r0×r0 block nonzero (= EgEg).
+            mul!(dP, Ae_delay, P)                # dP  = Ae_delay * P
+            mul!(dP, P, Ae_delayT, 1.0, 1.0)     # dP += P * Ae_delay'
+
+            # P_row_del and P_col_del = weighted sum of the two grid rows/cols of P.
+            @views P_row_del .= s1 .* P[rj, :] .+ s .* P[rjp, :]
+            @views P_col_del .= s1 .* P[:, rj] .+ s .* P[:, rjp]
+
+            # head_row = At * P[r0, :] + Bt * P_row_del   (n × N)
+            @views mul!(head_row, At, P[r0, :])
+            mul!(head_row, Bt, P_row_del, 1.0, 1.0)
+
+            # head_col = P[:, r0] * At' + P_col_del * Bt' (N × n)
+            @views mul!(head_col, P[:, r0], transpose(At))
+            mul!(head_col, P_col_del, transpose(Bt), 1.0, 1.0)
+
+            @views dP[r0, :] .+= head_row
+            @views dP[:, r0] .+= head_col
+
+            # Q contribution
+            @views dP[r0, r0] .+= EgEg
         end
 
         return nothing
@@ -251,7 +296,7 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=10,
 
     prob = dde ? DDEProblem(f_dde!, y0, hist, tspan) : ODEProblem(f!, y0, tspan)
 
-    meta = (Ae=Ae, ce=ce, h=h, N=N, n=n, m=m, τ_max=τ_grid)
+    meta = (Ae_delay=Ae_delay, ce=ce_delay, h=h, N=N, n=n, m=m, τ_max=τ_grid)
 
     return prob, meta
 end
