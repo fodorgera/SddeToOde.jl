@@ -1,6 +1,6 @@
 module SddeToOde
 
-using DifferentialEquations, LinearAlgebra, SparseArrays
+using DifferentialEquations, LinearAlgebra, SparseArrays, PreallocationTools
 
 include("main.jl")
 

@@ -6,9 +6,11 @@ authors = ["fodor "]
 [deps]
 DifferentialEquations = "0c46a032-eb83-5123-abaf-570d42b7fbaa"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+PreallocationTools = "d236fae5-4411-538c-8e31-a6e3d9e00b46"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
 [compat]
 DifferentialEquations = "7.17.0"
 LinearAlgebra = "1.11.0"
+PreallocationTools = "0.4, 1"
 SparseArrays = "1.12.0"

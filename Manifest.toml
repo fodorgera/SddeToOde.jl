@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "ff38665786b027e77522cb6373d68b9d4af22a40"
+project_hash = "767f06ba5abafb7c7f14f3e33e6a7a41cd14234f"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "f7304359109c768cf32dc5fa2d371565bb63b68a"
@@ -1687,7 +1687,7 @@ uuid = "53ae85a6-f571-4167-b2af-e1d143709226"
 version = "1.10.0"
 
 [[deps.SddeToOde]]
-deps = ["DifferentialEquations", "LinearAlgebra"]
+deps = ["DifferentialEquations", "LinearAlgebra", "PreallocationTools", "SparseArrays"]
 path = "."
 uuid = "7cb4db52-2e1f-408d-90d6-d93f80be34f8"
 version = "0.1.0"

@@ -189,16 +189,16 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=10,
     r0 = blockrange(n, 0)
     rm = blockrange(n, m)
 
-    # Workspaces
-    EgEg    = zeros(T0, n, n)
-    μ_del   = zeros(T0, n)
-    P_del   = zeros(T0, n, n)
-    P_0del  = zeros(T0, n, n)
-    # n×N and N×n buffers for the dense head row / column of the drift
-    head_row = zeros(T0, n, N)  # (At*P[r0,:] + Bt*P_row_del)
-    head_col = zeros(T0, N, n)  # (P[:,r0]*At' + P_col_del*Bt')
-    P_row_del = zeros(T0, n, N) # s1*P[rj,:] + s*P[rjp,:]
-    P_col_del = zeros(T0, N, n) # s1*P[:,rj] + s*P[:,rjp]
+    # Workspaces — wrapped in DiffCache so implicit solvers can reuse them when
+    # ForwardDiff calls f! with Dual-typed state vectors (autodiff Jacobians).
+    EgEg_cache      = DiffCache(zeros(T0, n, n))
+    μ_del_cache     = DiffCache(zeros(T0, n))
+    P_del_cache     = DiffCache(zeros(T0, n, n))
+    P_0del_cache    = DiffCache(zeros(T0, n, n))
+    head_row_cache  = DiffCache(zeros(T0, n, N))
+    head_col_cache  = DiffCache(zeros(T0, N, n))
+    P_row_del_cache = DiffCache(zeros(T0, n, N))
+    P_col_del_cache = DiffCache(zeros(T0, N, n))
 
     function f!(dy, y, p, t)
         @views μ = y[1:N]
@@ -206,6 +206,20 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=10,
 
         @views dμ = dy[1:N]
         @views dP = reshape(dy[N+1:end], N, N)
+
+        # Implicit solvers may autodiff over y (Jacobian) OR over t (Wfact
+        # for time-dependent f), so the buffer eltype must follow whichever of
+        # the two is currently a Dual. Probe DiffCache with a zero of the
+        # promoted eltype.
+        probe = zero(promote_type(eltype(y), typeof(t)))
+        EgEg      = get_tmp(EgEg_cache,      probe)
+        μ_del     = get_tmp(μ_del_cache,     probe)
+        P_del     = get_tmp(P_del_cache,     probe)
+        P_0del    = get_tmp(P_0del_cache,    probe)
+        head_row  = get_tmp(head_row_cache,  probe)
+        head_col  = get_tmp(head_col_cache,  probe)
+        P_row_del = get_tmp(P_row_del_cache, probe)
+        P_col_del = get_tmp(P_col_del_cache, probe)
 
         @inbounds begin
             y0v = μ[r0]
