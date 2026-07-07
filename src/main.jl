@@ -144,13 +144,18 @@ Mean/variance of original x(t):
   Vx(t) = P00 block (j=0,j=0)
 """
 function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=10,
-                                tspan=(0.0,T), dde=false, τ_max=nothing, kwargs...)
-    getA(t,x,xτ) = parseFunction(A,t,x,xτ)
-    getB(t,x,xτ) = parseFunction(B,t,x,xτ)
-    getc(t,x,xτ) = parseFunction(c,t,x,xτ)
-    getα(t,x,xτ) = parseFunction(α,t,x,xτ)
-    getβ(t,x,xτ) = parseFunction(β,t,x,xτ)
-    getγ(t,x,xτ) = parseFunction(γ,t,x,xτ)
+                                tspan=(0.0,T),p=nothing, dde=false, τ_max=nothing, kwargs...)
+    # Resolve the calling convention of each coefficient ONCE here, instead of
+    # paying try/catch (or even `applicable`) overhead inside the hot ODE rhs.
+    t0_probe  = 0.0
+    x0_probe  = φ(0.0)
+    xτ0_probe = φ(0.0)
+    getA = _resolve_coeff(A, t0_probe, x0_probe, xτ0_probe, p)
+    getB = _resolve_coeff(B, t0_probe, x0_probe, xτ0_probe, p)
+    getc = _resolve_coeff(c, t0_probe, x0_probe, xτ0_probe, p)
+    getα = _resolve_coeff(α, t0_probe, x0_probe, xτ0_probe, p)
+    getβ = _resolve_coeff(β, t0_probe, x0_probe, xτ0_probe, p)
+    getγ = _resolve_coeff(γ, t0_probe, x0_probe, xτ0_probe, p)
 
     τ_is_func = τ isa Function
     getτ(t) = τ_is_func ? τ(t) : τ
@@ -166,7 +171,7 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=10,
 
     use_interp = τ_is_func || τ_max !== nothing
 
-    A0 = getA(0.0, φ(0.0), φ(0.0))
+    A0 = getA(t0_probe, x0_probe, xτ0_probe)
     n = size(A0, 1)
 
     Ae_delay, ce_delay, h = build_delay_chain_drift(n, τ_grid; m=m)
@@ -176,7 +181,7 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=10,
     Ae_delayT = sparse(transpose(Ae_delay))
 
     # xj(0) ≈ φ(-j*h)
-    T0 = eltype(getc(0.0, φ(0.0), φ(0.0)))
+    T0 = eltype(getc(t0_probe, x0_probe, xτ0_probe))
     μ0 = zeros(T0, N)
     for j in 0:m
         μ0[blockrange(n,j)] .= φ(-j*h)
@@ -191,14 +196,14 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=10,
 
     # Workspaces — wrapped in DiffCache so implicit solvers can reuse them when
     # ForwardDiff calls f! with Dual-typed state vectors (autodiff Jacobians).
-    EgEg_cache      = DiffCache(zeros(T0, n, n))
-    μ_del_cache     = DiffCache(zeros(T0, n))
-    P_del_cache     = DiffCache(zeros(T0, n, n))
-    P_0del_cache    = DiffCache(zeros(T0, n, n))
-    head_row_cache  = DiffCache(zeros(T0, n, N))
-    head_col_cache  = DiffCache(zeros(T0, N, n))
-    P_row_del_cache = DiffCache(zeros(T0, n, N))
-    P_col_del_cache = DiffCache(zeros(T0, N, n))
+    EgEg_cache      = PreallocationTools.DiffCache(zeros(T0, n, n))
+    μ_del_cache     = PreallocationTools.DiffCache(zeros(T0, n))
+    P_del_cache     = PreallocationTools.DiffCache(zeros(T0, n, n))
+    P_0del_cache    = PreallocationTools.DiffCache(zeros(T0, n, n))
+    head_row_cache  = PreallocationTools.DiffCache(zeros(T0, n, N))
+    head_col_cache  = PreallocationTools.DiffCache(zeros(T0, N, n))
+    P_row_del_cache = PreallocationTools.DiffCache(zeros(T0, n, N))
+    P_col_del_cache = PreallocationTools.DiffCache(zeros(T0, N, n))
 
     function f!(dy, y, p, t)
         @views μ = y[1:N]
@@ -301,16 +306,46 @@ function get_ode_from_sdde(A, B, c, α, β, γ; τ, T, φ, m::Int=10,
     return prob, meta
 end
 
-function parseFunction(f::Function, t, args...)
-    try
-        return f(t,args...)
-    catch
-        return f(t)
-    end
+"""
+Lightweight callable that adapts a coefficient `f` to the unified
+`(t, x, xτ) -> value` interface used inside the ODE right-hand side.
+
+The calling convention is fixed at construction time (encoded as the third
+type parameter `Kind`), so the hot loop sees a fully typed, inlinable call —
+no `try/catch`, no per-step `applicable` check, no dynamic dispatch.
+
+Supported kinds:
+  - `:full`   →  `f(t, x, xτ, p)`
+  - `:state`  →  `f(t, x, xτ)`
+  - `:time`   →  `f(t)`
+  - `:const`  →  `f` itself (Matrix, UniformScaling, Number, …)
+"""
+struct CoeffCaller{F, P, Kind}
+    f::F
+    p::P
 end
 
-function parseFunction(f::Number, t, args...)
-    return f
+@inline (c::CoeffCaller{F, P, :full})(t, x, xτ) where {F, P}  = c.f(t, x, xτ, c.p)
+@inline (c::CoeffCaller{F, P, :state})(t, x, xτ) where {F, P} = c.f(t, x, xτ)
+@inline (c::CoeffCaller{F, P, :time})(t, x, xτ) where {F, P}  = c.f(t)
+@inline (c::CoeffCaller{F, P, :const})(t, x, xτ) where {F, P} = c.f
+
+"""
+Resolve the calling convention of a coefficient `f` once, based on which
+method is `applicable` at the representative point `(t0, x0, xτ0, p)`.
+Falls back to treating `f` as a constant value (Matrix / UniformScaling /
+Number / …) if it is not callable with any of the expected signatures.
+"""
+function _resolve_coeff(f, t0, x0, xτ0, p)
+    if applicable(f, t0, x0, xτ0, p)
+        return CoeffCaller{typeof(f), typeof(p), :full}(f, p)
+    elseif applicable(f, t0, x0, xτ0)
+        return CoeffCaller{typeof(f), typeof(p), :state}(f, p)
+    elseif applicable(f, t0)
+        return CoeffCaller{typeof(f), typeof(p), :time}(f, p)
+    else
+        return CoeffCaller{typeof(f), typeof(p), :const}(f, p)
+    end
 end
 
 
